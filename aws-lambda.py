@@ -3,41 +3,63 @@ from datetime import datetime, timedelta
 
 def lambda_handler(event, context):
     ec2 = boto3.client('ec2')
-    
-    # Delete snapshots not associated with any volume or attached to a terminated instance
-    snapshots = ec2.describe_snapshots(OwnerIds=['self'])['Snapshots']
-    for snapshot in snapshots:
-        snapshot_id = snapshot['SnapshotId']
-        
-        if 'VolumeId' not in snapshot:
-            # Delete snapshot not associated with any volume
-            ec2.delete_snapshot(SnapshotId=snapshot_id)
-            print(f"Deleted snapshot: {snapshot_id}")
-        else:
-            # Check if the volume's instance is terminated
-            volume_id = snapshot['VolumeId']
-            instance_id = ec2.describe_volumes(VolumeIds=[volume_id])['Volumes'][0]['Attachments'][0]['InstanceId']
-            instance_state = ec2.describe_instances(InstanceIds=[instance_id])['Reservations'][0]['Instances'][0]['State']['Name']
-            
-            if instance_state == 'terminated':
-                ec2.delete_snapshot(SnapshotId=snapshot_id)
-                print(f"Deleted snapshot attached to volume {volume_id}, terminated instance.")
-    
-    # Terminate dormant EC2 instances
-    cutoff_time = datetime.now() - timedelta(days=7)
-    instances = ec2.describe_instances()['Reservations']
-    
-    for reservation in instances:
+
+    # Get all EBS snapshots
+    response = ec2.describe_snapshots(OwnerIds=['self'])
+
+    # Get all active EC2 instance IDs
+    instances_response = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
+    active_instance_ids = set()
+
+    for reservation in instances_response['Reservations']:
         for instance in reservation['Instances']:
-            instance_id = instance['InstanceId']
-            launch_time = instance['LaunchTime']
-            state = instance['State']['Name']
-            
-            if launch_time < cutoff_time and state == 'stopped':
-                ec2.terminate_instances(InstanceIds=[instance_id])
-                print(f"Terminated instance: {instance_id}")
+            active_instance_ids.add(instance['InstanceId'])
+
+    # Iterate through each snapshot and delete if it's not attached to any volume or the volume is not attached to a running instance
+    for snapshot in response['Snapshots']:
+        snapshot_id = snapshot['SnapshotId']
+        volume_id = snapshot.get('VolumeId')
+
+        if not volume_id:
+            # Delete the snapshot if it's not attached to any volume
+            ec2.delete_snapshot(SnapshotId=snapshot_id)
+            print(f"Deleted EBS snapshot {snapshot_id} as it was not attached to any volume.")
+        else:
+            # Check if the volume still exists
+            try:
+                volume_response = ec2.describe_volumes(VolumeIds=[volume_id])
+                if not volume_response['Volumes'][0]['Attachments']:
+                    ec2.delete_snapshot(SnapshotId=snapshot_id)
+                    print(f"Deleted EBS snapshot {snapshot_id} as it was taken from a volume not attached to any running instance.")
+            except ec2.exceptions.ClientError as e:
+                if e.response['Error']['Code'] == 'InvalidVolume.NotFound':
+                    # The volume associated with the snapshot is not found (it might have been deleted)
+                    ec2.delete_snapshot(SnapshotId=snapshot_id)
+                    print(f"Deleted EBS snapshot {snapshot_id} as its associated volume was not found.")
+
+     # Calculate cutoff time (7 days ago from current time)
+    cutoff_time = datetime.now() - timedelta(days=7)
+    
+    # Describe instances and filter those that are stopped and older than cutoff_time
+    instances = ec2.describe_instances(Filters=[
+        {'Name': 'instance-state-name', 'Values': ['stopped']},
+        {'Name': 'launch-time', 'Values': [cutoff_time.strftime('%Y-%m-%dT%H:%M:%SZ')]}
+    ])
+    
+    # Extract instance IDs from the response
+    instance_ids = []
+    for reservation in instances['Reservations']:
+        for instance in reservation['Instances']:
+            instance_ids.append(instance['InstanceId'])
+    
+    # Terminate instances found
+    if instance_ids:
+        ec2.terminate_instances(InstanceIds=instance_ids)
+        print(f"Terminated instances: {', '.join(instance_ids)}")
+    else:
+        print("No instances found to terminate.")
     
     return {
         'statusCode': 200,
-        'body': 'EBS snapshots, volumes, and dormant EC2 instances cleanup complete'
-    }
+        'body': 'Unattached snapshots deleeted successfully, EC2 instances dormant for 7 days terminated successfully.'
+    }                
